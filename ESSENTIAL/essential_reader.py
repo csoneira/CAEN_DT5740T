@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Minimal DT5740 reader: computes trigger time (s) and integral for selected channels only.
+UPDATED: Supports dynamic binary header parsing for CAEN x740 family (6-word header).
+         + Includes status printout every 1000 events.
+
 Configuration:
   - essential_config.json : data paths, output directory, interesting channels, sample format.
   - input_dt5740.txt      : acquisition parameters (baseline samples, integration windows, etc.).
@@ -15,7 +18,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 MAX_CHANNELS = 32
-HEADER_WORDS = 8
+# CAEN x740 family (and standard WaveDump binary) uses 6 words for header
+HEADER_WORDS = 6 
 TTT_MAX = 2**31
 TTT_RES_NS = 16.0  # ns
 
@@ -104,28 +108,51 @@ class WaveReader:
     def __init__(
         self,
         path: Path,
-        samples: int,
+        expected_samples: int,
         sample_dtype: np.dtype,
         header_words: int = HEADER_WORDS,
     ) -> None:
         self.path = path
-        self.samples = samples
+        self.expected_samples = expected_samples
         self.sample_dtype = sample_dtype
         self.header_dtype = np.dtype("<u4")
         self.header_words = header_words
+        self.header_size_bytes = self.header_words * self.header_dtype.itemsize
         self.file = path.open("rb")
 
     def read_event(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        header_bytes = self.file.read(self.header_words * self.header_dtype.itemsize)
-        if len(header_bytes) < self.header_words * self.header_dtype.itemsize:
-            return None
+        # 1. Read Header (6 words = 24 bytes)
+        header_bytes = self.file.read(self.header_size_bytes)
+        if len(header_bytes) < self.header_size_bytes:
+            return None # End of file
+        
         header = np.frombuffer(header_bytes, dtype=self.header_dtype, count=self.header_words)
 
-        sample_bytes = self.file.read(self.samples * self.sample_dtype.itemsize)
-        if len(sample_bytes) < self.samples * self.sample_dtype.itemsize:
+        # 2. Determine Waveform Size from Header
+        # header[0] contains the Total Event Size in Bytes (Header + Data)
+        total_event_size_bytes = header[0]
+        data_size_bytes = total_event_size_bytes - self.header_size_bytes
+
+        # Sanity check
+        if data_size_bytes < 0:
+            print(f"[ERROR] Invalid event size in header: {total_event_size_bytes}")
             return None
 
-        pulse = np.frombuffer(sample_bytes, dtype=self.sample_dtype, count=self.samples).astype(np.float32)
+        # 3. Read Waveform Data
+        sample_bytes = self.file.read(data_size_bytes)
+        if len(sample_bytes) < data_size_bytes:
+            return None # Incomplete event file
+        
+        # 4. Convert bytes to samples
+        pulse = np.frombuffer(sample_bytes, dtype=self.sample_dtype)
+        
+        # 5. Handle Record Length Mismatch
+        if len(pulse) != self.expected_samples:
+            if len(pulse) > self.expected_samples:
+                pulse = pulse[:self.expected_samples]
+            # If less, we continue, and the main loop handles padding if needed
+
+        pulse = pulse.astype(np.float32)
         return header, pulse
 
     def close(self) -> None:
@@ -165,7 +192,6 @@ def main() -> None:
     print("############################################################")
     print(f"# RECORD_LENGTH in input_dt5740.txt = {input_cfg.samples}")
     print("# IMPORTANT: ensure WaveDump's RECORD_LENGTH matches this value")
-    print("# so the Python reader and the acquisition share the same window.")
     print("############################################################")
     print("")
     output_dir = resolve_paths(base, [cfg.get("output_dir", "ESSENTIAL_OUTPUTS")])[0]
@@ -218,6 +244,11 @@ def main() -> None:
                     break
                 header, pulse = payload
 
+                if len(pulse) < input_cfg.blsamples:
+                    print(f"[WARN] Event {event_index} Ch {ch}: Pulse too short.")
+                    complete = False
+                    break
+
                 bl = float(np.mean(pulse[: input_cfg.blsamples]))
                 polarity = input_cfg.polarity[ch]
                 peak = float(np.max(pulse)) if polarity >= 1 else float(np.min(pulse))
@@ -232,14 +263,18 @@ def main() -> None:
 
                 shift = thres_sample - trgsample
                 newpulse = np.empty_like(pulse)
+                if len(newpulse) != input_cfg.samples:
+                    newpulse = np.zeros(input_cfg.samples, dtype=np.float32)
+
                 for idx in range(1, input_cfg.samples + 1):
                     src = idx + shift
-                    if 1 <= src <= input_cfg.samples:
+                    if 1 <= src <= len(pulse):
                         newpulse[idx - 1] = pulse[src - 1] - bl
                     else:
                         newpulse[idx - 1] = 0.0
 
                 raw_ttt = int(header[5])
+                
                 if pretime[ch] > raw_ttt:
                     timecycle[ch] += 1
                 pretime[ch] = raw_ttt
@@ -252,6 +287,17 @@ def main() -> None:
                     lo, hi = hi, lo
                 integral = float(polarity * np.sum(newpulse[lo : hi + 1]))
                 event_data[ch] = (start_time, fine_time, integral)
+
+                # ========================================================
+                # NEW: Print Header and Pulse Info every 1000 events
+                # ========================================================
+                if event_index % 1000 == 0:
+                    print(f"[MONITOR] Event #{event_index} | Channel {ch}")
+                    print(f"  HEADER -> EvtCnt: {header[4]} | TTT: {header[5]} | Size(bytes): {header[0]}")
+                    print(f"  PULSE  -> BaseLn: {bl:.1f} | Peak: {peak:.1f} | Integral: {integral:.1f}")
+                    print(f"  TIME   -> {start_time:.6f} s")
+                    print("-" * 50)
+                # ========================================================
 
             if not complete:
                 break

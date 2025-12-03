@@ -3,7 +3,7 @@
     "../DATA"
   ],
   "output_dir": "ESSENTIAL_OUTPUTS",
-  "channels": [1, 2, 3, 9, 17, 22],
+  "channels": [0,1],
   "suffix": "",
   "sample_format": "int16",
   "max_events": 0
